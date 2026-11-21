@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Detector de Bola Fora - Tênis</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #f0f6fc;
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      overflow: hidden;
+    }
+    header {
+      padding: 10px 14px;
+      background: #161b22;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      z-index: 5;
+    }
+    .stage {
+      position: relative;
+      flex: 1;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    video { display: none; }
+    canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      touch-action: none;
+    }
+    .flash-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255, 30, 30, 0.85);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.08s ease-out;
+      z-index: 20;
+    }
+    .flash-overlay.active { opacity: 1; }
+    .banner {
+      position: fixed;
+      top: 56px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #da3633;
+      color: #fff;
+      padding: 8px 18px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 16px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.12s;
+      z-index: 25;
+    }
+    .banner.show { opacity: 1; }
+    .controls {
+      padding: 10px 12px;
+      background: #161b22;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      z-index: 5;
+    }
+    button {
+      padding: 10px 8px;
+      border: none;
+      border-radius: 8px;
+      background: #238636;
+      color: #fff;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    button.secondary { background: #30363d; }
+    button.warn { background: #9e6a03; }
+    .hint {
+      font-size: 12px;
+      color: #8b949e;
+      padding: 0 12px 8px;
+      background: #161b22;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="flash" class="flash-overlay"></div>
+  <div id="banner" class="banner">BOLA FORA!</div>
+
+  <header>
+    <span id="status">Toque 2 pts p/ definir a linha</span>
+    <span id="count">Fora: 0</span>
+  </header>
+
+  <div class="stage">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div class="hint">
+    1) Toque 2 pontos na tela para traçar a linha. 2) O lado marcado em VERDE é "DENTRO"; o outro é "FORA".
+  </div>
+
+  <div class="controls">
+    <button id="btnCam">Iniciar Câmera</button>
+    <button id="btnFlip" class="secondary">Trocar Lado "Dentro"</button>
+    <button id="btnReset" class="warn">Limpar Linha</button>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const statusEl = document.getElementById('status');
+    const countEl = document.getElementById('count');
+    const flashEl = document.getElementById('flash');
+    const bannerEl = document.getElementById('banner');
+
+    let running = false;
+    let linePts = [];       // [{x, y}, {x, y}] em coordenadas normalizadas (0..1)
+    let insideSign = 1;     // +1 ou -1 define qual lado da linha é "DENTRO"
+    let outCount = 0;
+    let lastAlertAt = 0;
+    let videoTrack = null;
+    let torchOn = false;
+    let audioCtx = null;
+
+    function beepAlert() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(1150, audioCtx.currentTime);
+      gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.26);
+    }
+
+    async function setTorch(state) {
+      if (!videoTrack || !videoTrack.getCapabilities) return;
+      const caps = videoTrack.getCapabilities();
+      if (caps.torch) {
+        try {
+          await videoTrack.applyConstraints({ advanced: [{ torch: state }] });
+          torchOn = state;
+        } catch (_) {}
+      }
+    }
+
+    async function triggerOutAlert() {
+      const now = performance.now();
+      if (now - lastAlertAt < 700) return; // debounce de 700ms
+      lastAlertAt = now;
+
+      outCount++;
+      countEl.textContent = `Fora: ${outCount}`;
+      beepAlert();
+
+      flashEl.classList.add('active');
+      bannerEl.classList.add('show');
+      await setTorch(true);
+
+      setTimeout(async () => {
+        flashEl.classList.remove('active');
+        bannerEl.classList.remove('show');
+        await setTorch(false);
+      }, 220);
+    }
+
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+      video.srcObject = stream;
+      videoTrack = stream.getVideoTracks()[0];
+      await video.play();
+
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      running = true;
+      statusEl.textContent = 'Câmera ativa • Marque 2 pts na linha';
+      requestAnimationFrame(loop);
+    }
+
+    // Sinal positivo/negativo de um ponto (px, py) em relação ao segmento (p1 -> p2)
+    function sideOfLine(px, py, p1, p2) {
+      return (p2.x - p1.x) * (py - p1.y) - (p2.y - p1.y) * (px - p1.x);
+    }
+
+    // Detecção simples de bola amarelo-esverdeada de tênis (RGB heurístico)
+    function detectBall(frameData, w, h) {
+      let sumX = 0, sumY = 0, count = 0;
+      const step = 2; // amostragem para manter FPS alto no celular
+
+      for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+          const idx = (y * w + x) * 4;
+          const r = frameData[idx];
+          const g = frameData[idx + 1];
+          const b = frameData[idx + 2];
+
+          // Bola de tênis costuma ter R alto, G alto e B bem menor
+          if (r > 150 && g > 165 && b < 110 && (g - b) > 70 && (r - b) > 50) {
+            sumX += x;
+            sumY += y;
+            count++;
+          }
+        }
+      }
+
+      if (count >= 12 && count <= 1800) {
+        return { x: sumX / count, y: sumY / count, area: count };
+      }
+      return null;
+    }
+
+    function loop() {
+      if (!running) return;
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.drawImage(video, 0, 0, w, h);
+      const img = ctx.getImageData(0, 0, w, h);
+      const ball = detectBall(img.data, w, h);
+
+      // Desenha linha calibrada e indicação do lado "DENTRO"
+      if (linePts.length === 2) {
+        const p1 = { x: linePts[0].x * w, y: linePts[0].y * h };
+        const p2 = { x: linePts[1].x * w, y: linePts[1].y * h };
+
+        // Meio da linha + vetor normal apontando para o lado "DENTRO"
+        const mx = (p1.x + p2.x) / 2;
+        const my = (p1.y + p2.y) / 2;
+        const dx = p2.x - p1.x;
+        const dy = p2.y - p1.y;
+        const len = Math.hypot(dx, dy) || 1;
+        // Normal à esquerda de p1->p2 é (-dy, dx)
+        const nx = (-dy / len) * insideSign;
+        const ny = (dx / len) * insideSign;
+
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = '#00e5ff';
+        ctx.lineWidth = 4;
+        ctx.stroke();
+
+        // Seta verde indicando lado DENTRO
+        ctx.beginPath();
+        ctx.moveTo(mx, my);
+        ctx.lineTo(mx + nx * 36, my + ny * 36);
+        ctx.strokeStyle = '#2ea043';
+        ctx.lineWidth = 4;
+        ctx.stroke();
+      }
+
+      // Desenha pontos de calibração
+      for (const pt of linePts) {
+        ctx.beginPath();
+        ctx.arc(pt.x * w, pt.y * h, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffcc00';
+        ctx.fill();
+      }
+
+      // Avalia posição da bola em relação à linha
+      if (ball) {
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, 14, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffeb3b';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+
+        if (linePts.length === 2) {
+          const p1 = { x: linePts[0].x * w, y: linePts[0].y * h };
+          const p2 = { x: linePts[1].x * w, y: linePts[1].y * h };
+          const s = sideOfLine(ball.x, ball.y, p1, p2);
+          const isInside = (s * insideSign) >= 0;
+
+          if (!isInside) {
+            triggerOutAlert();
+          }
+        }
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      if (linePts.length >= 2) return;
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.clientX - rect.left) / rect.width;
+      const ny = (e.clientY - rect.top) / rect.height;
+      linePts.push({ x: nx, y: ny });
+      statusEl.textContent = linePts.length === 1
+        ? 'Toque o 2º ponto da linha'
+        : 'Linha definida! Monitorando...';
+    });
+
+    document.getElementById('btnCam').addEventListener('click', startCamera);
+    document.getElementById('btnFlip').addEventListener('click', () => {
+      insideSign *= -1;
+    });
+    document.getElementById('btnReset').addEventListener('click', () => {
+      linePts = [];
+      statusEl.textContent = 'Toque 2 pts p/ definir a linha';
+    });
+  </script>
+</body>
+</html>
